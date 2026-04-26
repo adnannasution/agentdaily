@@ -1,23 +1,39 @@
 """
 Daily Executive Brief Agent
 - Standalone Railway service (worker)
-- Query PostgreSQL — selalu ambil data bulan/periode TERAKHIR per tabel
-- Generate report via Claude API
+- Query langsung ke PostgreSQL
+- Generate report via Dinoiki (OpenAI-compatible endpoint)
 - Kirim WhatsApp via Fonnte jam 06.00 WIB
 """
 
-import os, time, json, requests, psycopg2, psycopg2.extras, schedule, anthropic
+import os, time, json, requests, psycopg2, psycopg2.extras, schedule
+from openai import OpenAI
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL      = os.getenv("DATABASE_URL", "")
-FONNTE_TOKEN      = os.getenv("FONNTE_TOKEN", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-WA_TARGETS        = os.getenv("REPORT_WA_TARGETS", "")
-SEND_TIME_UTC     = os.getenv("REPORT_SEND_TIME_UTC", "23:00")
-WIB               = timezone(timedelta(hours=7))
+DATABASE_URL   = os.getenv("DATABASE_URL", "")
+FONNTE_TOKEN   = os.getenv("FONNTE_TOKEN", "")
+DINOIKI_API_KEY= os.getenv("DINOIKI_API_KEY", "")
+WA_TARGETS     = os.getenv("REPORT_WA_TARGETS", "")
+SEND_TIME_UTC  = os.getenv("REPORT_SEND_TIME_UTC", "23:00")
+WIB            = timezone(timedelta(hours=7))
+
+# ─── LLM (Dinoiki — OpenAI-compatible) ───────────────────────────────────────
+llm = OpenAI(
+    api_key=DINOIKI_API_KEY,
+    base_url="https://ai.dinoiki.com/v1"
+)
+
+def ask_llm(prompt: str) -> str:
+    resp = llm.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.7,
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.choices[0].message.content
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
 def get_conn():
@@ -35,17 +51,10 @@ def q(sql, params=None):
         return []
 
 # ─── DATA GATHERING ───────────────────────────────────────────────────────────
-# Strategi per tabel:
-# • Punya code_current  → WHERE code_current = 1  (sudah di-flag sebagai data aktif/terbaru)
-# • Punya periode (Text)→ WHERE periode = MAX(periode)
-# • Punya month_update  → WHERE month_update = MAX(month_update)
-# • Punya bulan+tahun   → WHERE tahun = MAX(tahun) AND bulan = MAX(bulan) pada tahun itu
-# • Punya report_date   → WHERE report_date = MAX(report_date)
-
 def gather_data():
     data = {}
 
-    # 1. BAD ACTOR — filter periode terbaru, hanya yang belum closed
+    # 1. BAD ACTOR — periode terbaru, belum closed
     data["bad_actor"] = q("""
         SELECT ru, tag_number, status, problem, action_plan,
                progress, target_date, periode
@@ -56,7 +65,7 @@ def gather_data():
         LIMIT 20
     """)
 
-    # 2. ICU — filter report_date terbaru, hanya yang belum closed
+    # 2. ICU — report_date terbaru, belum closed
     data["icu"] = q("""
         SELECT ru, tag_no, icu_status, issue, mitigation,
                progress, target_closed, report_date
@@ -67,7 +76,7 @@ def gather_data():
         LIMIT 20
     """)
 
-    # 3. ZERO CLAMP — yang masih terpasang (belum dilepas), semua periode
+    # 3. ZERO CLAMP — masih terpasang (belum dilepas)
     data["zero_clamp"] = q("""
         SELECT ru, area, unit, tag_no_ln, services, description,
                type_damage, tanggal_dipasang, tanggal_rencana_perbaikan,
@@ -78,7 +87,7 @@ def gather_data():
         LIMIT 15
     """)
 
-    # 4. PIPELINE — filter bulan+tahun terbaru, rem_life rendah atau ada temp repair
+    # 4. PIPELINE — bulan+tahun terbaru, rem_life rendah atau ada temp repair
     data["pipeline"] = q("""
         SELECT refinery_unit, tag_number, fluida_service, nps,
                from_location, to_location, last_measured_thickness,
@@ -96,7 +105,7 @@ def gather_data():
         LIMIT 15
     """)
 
-    # 5. PAF — code_current = 1 (sudah di-flag data terbaru), hanya yang warna warning
+    # 5. PAF — code_current = 1, hanya yang warning
     data["paf"] = q("""
         SELECT ru, type, target_realisasi, value, plan_unplan,
                month_update, color
@@ -128,7 +137,7 @@ def gather_data():
         LIMIT 15
     """)
 
-    # 8. CRITICAL EQUIPMENT UTL — code_current = 1, ada highlight issue
+    # 8. CRITICAL EQUIPMENT UTL — code_current = 1, ada issue
     data["critical_utl"] = q("""
         SELECT refinery_unit, type_equipment, highlight_issue,
                corrective_action, target_corrective, traffic_corrective,
@@ -140,7 +149,7 @@ def gather_data():
         LIMIT 10
     """)
 
-    # 9. READINESS JETTY — month_update terbaru, yang ada concern
+    # 9. READINESS JETTY — month_update terbaru, ada concern
     data["readiness_jetty"] = q("""
         SELECT refinery_unit, area, unit, tag_no, status_operation,
                status_tuks, expired_tuks, status_ijin_ops, expired_ijin_ops,
@@ -150,16 +159,16 @@ def gather_data():
         FROM readiness_jetty
         WHERE month_update = (SELECT MAX(month_update) FROM readiness_jetty)
           AND (
-            LOWER(COALESCE(status_operation,''))  NOT IN ('normal','siap','ok','ready')
-            OR LOWER(COALESCE(status_tuks,''))    NOT IN ('valid','ok','aktif')
+            LOWER(COALESCE(status_operation,''))   NOT IN ('normal','siap','ok','ready')
+            OR LOWER(COALESCE(status_tuks,''))     NOT IN ('valid','ok','aktif')
             OR LOWER(COALESCE(status_ijin_ops,'')) NOT IN ('valid','ok','aktif')
-            OR LOWER(COALESCE(status_isps,''))    NOT IN ('valid','ok','aktif')
+            OR LOWER(COALESCE(status_isps,''))     NOT IN ('valid','ok','aktif')
           )
         ORDER BY refinery_unit, tag_no
         LIMIT 10
     """)
 
-    # 10. WORKPLAN JETTY — month_update terbaru, item belum selesai
+    # 10. WORKPLAN JETTY — month_update terbaru, belum selesai
     data["workplan_jetty"] = q("""
         SELECT refinery_unit, area, unit, tag_no, item,
                status_item, remark, rtl_action_plan,
@@ -171,7 +180,7 @@ def gather_data():
         LIMIT 15
     """)
 
-    # 11. READINESS TANK — month_update terbaru, yang ada issue
+    # 11. READINESS TANK — month_update terbaru, ada issue
     data["readiness_tank"] = q("""
         SELECT refinery_unit, area, unit, tag_number,
                type_tangki, service_tangki, prioritas, status_operational,
@@ -201,7 +210,7 @@ def gather_data():
         LIMIT 15
     """)
 
-    # 13. READINESS SPM — month_update terbaru, yang ada issue
+    # 13. READINESS SPM — month_update terbaru, ada issue
     data["readiness_spm"] = q("""
         SELECT refinery_unit, area, unit, tag_no, status_operation,
                status_laik_operasi, expired_laik_operasi,
@@ -213,14 +222,14 @@ def gather_data():
         FROM readiness_spm
         WHERE month_update = (SELECT MAX(month_update) FROM readiness_spm)
           AND (
-            LOWER(COALESCE(status_operation,''))    NOT IN ('normal','siap','ok','ready')
+            LOWER(COALESCE(status_operation,''))      NOT IN ('normal','siap','ok','ready')
             OR LOWER(COALESCE(status_laik_operasi,'')) NOT IN ('valid','ok','aktif')
           )
         ORDER BY refinery_unit, tag_no
         LIMIT 10
     """)
 
-    # 14. ATG — month_update terbaru, yang ada issue
+    # 14. ATG — month_update terbaru, ada issue
     data["atg"] = q("""
         SELECT refinery_unit, tag_no_tangki, tag_no_atg,
                status_atg, status_interkoneksi_atg,
@@ -236,7 +245,7 @@ def gather_data():
         LIMIT 15
     """)
 
-    # 15. MONITORING OPERASI — code_current = 1, yang ada limitasi
+    # 15. MONITORING OPERASI — code_current = 1, ada limitasi
     data["monitoring_operasi"] = q("""
         SELECT refinery_unit, unit_proses, unit, actual, target_sts,
                plant_readiness, limitasi_alert_process, mitigasi_process,
@@ -254,9 +263,8 @@ def gather_data():
     return data
 
 
-# ─── REPORT GENERATION ────────────────────────────────────────────────────────
-def generate_report(data):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ─── REPORT GENERATION (via Dinoiki) ─────────────────────────────────────────
+def generate_report(data: dict) -> str:
     now_wib = datetime.now(WIB)
     summary = {k: len(v) for k, v in data.items()}
     data_str = json.dumps(data, ensure_ascii=False, default=str, indent=2)
@@ -316,16 +324,11 @@ FORMAT WAJIB:
 Legend: 🟢 Terkendali | 🟡 Watch | 🟠 Action | 🔴 Urgent
 _Auto-generated · PRISMA Report Agent_"""
 
-    msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return msg.content[0].text
+    return ask_llm(prompt)
 
 
 # ─── WHATSAPP ─────────────────────────────────────────────────────────────────
-def send_wa(target, message):
+def send_wa(target: str, message: str) -> bool:
     try:
         resp = requests.post(
             "https://api.fonnte.com/send",
@@ -354,7 +357,7 @@ def run_report_job():
     for k, v in data.items():
         print(f"  {k}: {len(v)} baris")
 
-    print("[2/3] 🤖 Generate report (Claude)...")
+    print("[2/3] 🤖 Generate report (Dinoiki gpt-4o)...")
     try:
         report = generate_report(data)
         print(f"  ✅ {len(report)} karakter")
@@ -383,7 +386,7 @@ def main():
     print(f"  Jadwal  : {SEND_TIME_UTC} UTC  =  06.00 WIB")
     print(f"  DB      : {'✅' if DATABASE_URL else '❌ Missing'}")
     print(f"  Fonnte  : {'✅' if FONNTE_TOKEN else '❌ Missing'}")
-    print(f"  Claude  : {'✅' if ANTHROPIC_API_KEY else '❌ Missing'}")
+    print(f"  Dinoiki : {'✅' if DINOIKI_API_KEY else '❌ Missing'}")
     print(f"  Target  : {WA_TARGETS or '❌ Missing'}")
     print("=" * 50)
 
